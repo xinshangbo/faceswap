@@ -15,32 +15,39 @@ import logging
 import os
 import traceback
 from io import StringIO
+from math import sqrt
 
 import cv2
 import dlib
 
 from lib.gpu_stats import GPUStats
 from lib.utils import rotate_landmarks
+from plugins.extract._config import Config
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
+def get_config(plugin_name):
+    """ Return the config for the requested model """
+    return Config(plugin_name).config_dict
+
+
 class Detector():
     """ Detector object """
-    def __init__(self, loglevel, rotation=None):
-        logger.debug("Initializing %s: (rotation: %s)", self.__class__.__name__, rotation)
+    def __init__(self, loglevel, rotation=None, min_size=0):
+        logger.debug("Initializing %s: (rotation: %s, min_size: %s)",
+                     self.__class__.__name__, rotation, min_size)
+        self.config = get_config(".".join(self.__module__.split(".")[-2:]))
         self.loglevel = loglevel
         self.cachepath = os.path.join(os.path.dirname(__file__), ".cache")
         self.rotation = self.get_rotation_angles(rotation)
+        self.min_size = min_size
         self.parent_is_pool = False
         self.init = None
 
         # The input and output queues for the plugin.
         # See lib.queue_manager.QueueManager for getting queues
         self.queues = {"in": None, "out": None}
-
-        # Scaling factor for image. Plugin dependent
-        self.scale = 1.0
 
         #  Path to model if required
         self.model_path = self.set_model_path()
@@ -102,10 +109,14 @@ class Detector():
             Do not override """
         try:
             self.detect_faces(*args, **kwargs)
-        except Exception:  # pylint: disable=broad-except
-            logger.error("Caught exception in child process: %s", os.getpid())
+        except Exception as err:  # pylint: disable=broad-except
+            logger.error("Caught exception in child process: %s: %s", os.getpid(), str(err))
+            # Display traceback if in initialization stage
+            if not self.init.is_set():
+                logger.exception("Traceback:")
             tb_buffer = StringIO()
             traceback.print_exc(file=tb_buffer)
+            logger.trace(tb_buffer.getvalue())
             exception = {"exception": (os.getpid(), tb_buffer)}
             self.queues["out"].put(exception)
             exit(1)
@@ -118,15 +129,30 @@ class Detector():
             logger.trace("Item out: %s", {key: val
                                           for key, val in output.items()
                                           if key != "image"})
+            if self.min_size > 0 and output.get("detected_faces", None):
+                output["detected_faces"] = self.filter_small_faces(output["detected_faces"])
         else:
             logger.trace("Item out: %s", output)
         self.queues["out"].put(output)
 
+    def filter_small_faces(self, detected_faces):
+        """ Filter out any faces smaller than the min size threshold """
+        retval = list()
+        for face in detected_faces:
+            face_size = ((face.right() - face.left()) ** 2 +
+                         (face.bottom() - face.top()) ** 2) ** 0.5
+            if face_size < self.min_size:
+                logger.debug("Removing detected face: (face_size: %s, min_size: %s",
+                             face_size, self.min_size)
+                continue
+            retval.append(face)
+        return retval
+
     # <<< DETECTION IMAGE COMPILATION METHODS >>> #
     def compile_detection_image(self, image, is_square, scale_up):
         """ Compile the detection image """
-        self.set_scale(image, is_square=is_square, scale_up=scale_up)
-        return self.set_detect_image(image)
+        scale = self.set_scale(image, is_square=is_square, scale_up=scale_up)
+        return [self.set_detect_image(image, scale), scale]
 
     def set_scale(self, image, is_square=False, scale_up=False):
         """ Set the scale factor for incoming image """
@@ -144,23 +170,26 @@ class Detector():
             target = self.target
 
         if scale_up or target < source:
-            self.scale = target / source
+            scale = sqrt(target / source)
         else:
-            self.scale = 1.0
-        logger.trace("Detector scale: %s", self.scale)
+            scale = 1.0
+        logger.trace("Detector scale: %s", scale)
 
-    def set_detect_image(self, input_image):
+        return scale
+
+    @staticmethod
+    def set_detect_image(input_image, scale):
         """ Convert the image to RGB and scale """
         # pylint: disable=no-member
         image = input_image[:, :, ::-1].copy()
-        if self.scale == 1.0:
+        if scale == 1.0:
             return image
 
         height, width = image.shape[:2]
-        interpln = cv2.INTER_LINEAR if self.scale > 1.0 else cv2.INTER_AREA
-        dims = (int(width * self.scale), int(height * self.scale))
+        interpln = cv2.INTER_LINEAR if scale > 1.0 else cv2.INTER_AREA
+        dims = (int(width * scale), int(height * scale))
 
-        if self.scale < 1.0:
+        if scale < 1.0:
             logger.verbose("Resizing image from %sx%s to %s.",
                            width, height, "x".join(str(i) for i in dims))
 
